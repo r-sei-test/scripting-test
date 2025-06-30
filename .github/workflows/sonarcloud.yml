@@ -1,0 +1,59 @@
+name: SonarCloud analysis
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  pull-requests: read
+  security-events: write
+
+jobs:
+  Analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Prepare reports directory and compile_commands.json
+        run: |
+          mkdir -p reports
+          # Build a minimal compile_commands.json for main.c
+          echo '[' > compile_commands.json
+          echo '  { "directory": "'"${PWD}"'", "command": "gcc -std=c17 -I. -O2 -g main.c -o main", "file": "main.c" }' >> compile_commands.json
+          echo ']' >> compile_commands.json
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          format: sarif
+          output: reports/trivy.sarif
+          exit-code: 0
+
+      - name: Install Semgrep CLI
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install Semgrep
+        run: python3 -m pip install --upgrade semgrep
+
+      - name: Run Semgrep scan
+        run: semgrep --config p/ci --sarif --output reports/semgrep.sarif .
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@4006f663ecaf1f8093e8e4abb9227f6041f52216
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: .
+          args: |
+            -Dsonar.login=${{ env.SONAR_TOKEN }}
+            -Dsonar.sarifReportPaths=reports/trivy.sarif,reports/semgrep.sarif
+            -Dsonar.cfamily.compile-commands=compile_commands.json
+

@@ -1,0 +1,61 @@
+name: Trivy
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '27 16 * * 0'
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  trivy-scan:
+    name: Trivy Full Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python (optional)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies if present
+        run: |
+          if [ -f requirements.txt ]; then
+            python -m venv .venv
+            source .venv/bin/activate
+            pip install -r requirements.txt
+          fi
+
+      - name: Run Trivy (vuln, misconfig, secret, iac)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: 'vuln'
+          format: template
+          template: '@/contrib/sarif.tpl'
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Verify SARIF file
+        run: |
+          ls -lah .
+          test -f trivy-results.sarif && echo "SARIF generated" || (echo "SARIF missing" && exit 1)
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: success()
+        with:
+          sarif_file: trivy-results.sarif
