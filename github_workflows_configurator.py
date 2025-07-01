@@ -33,7 +33,7 @@ os.environ["SSL_CERT_FILE"] = certifi.where()
 # Defaults and configuration values
 DEFAULT_BRANCH = "main"  # Default Git branch to use
 SOURCE_REPO = (
-    "https://github.com/r-sei-test/test"  # Source repo URL to pull workflows from
+    "git@github.com:r-sei-test/test.git"  # Source repo URL to pull workflows from
 )
 WORKFLOW_SUBDIR = ".github/workflows"  # Subdirectory where workflows live
 GITHUB_API = "https://api.github.com"  # Base URL for GitHub API
@@ -360,6 +360,35 @@ class GitHubAPI:
                 logger.info("Workflow %s already disabled; skipping.", wf_id)
                 return
         raise APIError(f"Failed to disable workflow {wf_id}: {resp.text}")
+    
+    def list_alerts(self) -> List[Dict]:
+        """
+        Fetch all *open* code-scanning alerts for the repo (paginated).
+        """
+        alerts = []
+        url = f"{self.base}/repos/{self.owner}/{self.repo}/code-scanning/alerts"
+        params = {"per_page": 100, "page": 1, "state": "open"}
+        while True:
+            resp = self._request("GET", url, params=params)
+            if resp.status_code == 404:
+                # no alerts at all
+                break
+            resp.raise_for_status()
+            page = resp.json()
+            if not page:
+                break
+            alerts.extend(page)
+            params["page"] += 1
+        return alerts
+
+    def dismiss_alert(self, alert_number: int) -> None:
+        """
+        Dismiss a single code-scanning alert by number.
+        """
+        url = f"{self.base}/repos/{self.owner}/{self.repo}/code-scanning/alerts/{alert_number}"
+        body = {"state": "dismissed", "dismissed_reason": "won't fix"}
+        resp = self._request("PATCH", url, json=body)
+        resp.raise_for_status()
 
     def list_analyses(self) -> List[Dict]:
         """
@@ -375,43 +404,52 @@ class GitHubAPI:
 
     def delete_analysis(self, analysis_url: str) -> None:
         """
-        Delete a single analysis, following GitHub’s confirm_delete_url if provided.
-        Handles HTTP 200 or 202 as 'needs confirm'.
+        Delete a single analysis.  Handles all GitHub variants that ask
+        for explicit confirmation: 200, 202 **or** 400 with a confirm_delete hint.
         """
+        def _needs_confirm(resp: requests.Response) -> bool:
+            return (
+                resp.status_code in (200, 202) or
+                (resp.status_code == 400 and "confirm_delete" in resp.text)
+            )
+
         resp = self._request("DELETE", analysis_url)
 
-        # Case 1: Already gone
+        # Already gone?
         if resp.status_code in (204, 404):
             logger.info("Analysis already removed: %s", analysis_url)
             return
 
-        # Case 2: GitHub asks for confirmation (200 or 202)
-        if resp.status_code in (200, 202):
-            payload = resp.json()
-            confirm_url = payload.get("confirm_delete_url")
+        # GitHub says: “please confirm first”
+        if _needs_confirm(resp):
+            # Use the URL GitHub gives us if present, otherwise just add the flag
+            confirm_url = (
+                resp.json().get("confirm_delete_url")
+                if resp.headers.get("content-type", "").startswith("application/json")
+                else None
+            )
             if not confirm_url:
-                raise APIError(f"No confirm_delete_url in response: {payload}")
-            # Append confirm_delete parameter if missing
-            if "?confirm_delete" not in confirm_url:
-                confirm_url += "?confirm_delete=true"
-            resp2 = self._request("DELETE", confirm_url)
-            # treat 204 or 404 as success
-            if resp2.status_code in (204, 404):
-                logger.info(
-                    "Confirmed (or already deleted) analysis at %s", confirm_url
+                # fall back to same URL + flag
+                confirm_url = (
+                    analysis_url
+                    if analysis_url.endswith("?confirm_delete=true")
+                    else analysis_url + "?confirm_delete=true"
                 )
-                return
-            # fallback retry once on transient 200/202
-            if resp2.status_code in (200, 202):
-                time.sleep(self.backoff)
-                resp3 = self._request("DELETE", confirm_url)
-                if resp3.status_code in (204, 404):
-                    logger.info("Confirmed on retry analysis at %s", confirm_url)
-                    return
-            raise APIError(f"Confirm-delete failed ({resp2.status_code}): {resp2.text}")
 
-        # Case 3: Something else went wrong
-        raise APIError(f"Failed to delete analysis ({resp.status_code}): {resp.text}")
+            resp2 = self._request("DELETE", confirm_url)
+
+            if resp2.status_code in (204, 404):
+                logger.info("Confirmed and deleted analysis at %s", confirm_url)
+                return
+
+            raise APIError(
+                f"Confirm‑delete failed ({resp2.status_code}): {resp2.text}"
+            )
+
+        # Anything else is a real failure
+        raise APIError(
+            f"Failed to delete analysis ({resp.status_code}): {resp.text}"
+        )
 
 
 def cleanup_remote_workflows(api: GitHubAPI, deleted: List[str]) -> None:
@@ -428,31 +466,34 @@ def cleanup_remote_workflows(api: GitHubAPI, deleted: List[str]) -> None:
         else:
             logger.debug("No remote workflow entry for %s", name)
 
+def cleanup_analysis(api: GitHubAPI, deleted_workflows: List[str]) -> None:
+    """
+    Permanently delete all Code Scanning analyses whose analysis_key
+    was produced by any of the deleted workflow files.
+    """
+    # 1) list all analyses
+    try:
+        all_analyses = api.list_analyses()
+    except APIError as e:
+        logger.warning("Could not list analyses, skipping cleanup: %s", e)
+        return
 
-def cleanup_analysis(api: GitHubAPI, deleted: List[str]) -> None:
-    """
-    Remove all deletable analyses related to the deleted workflows.
-    Only runs through the current list once to avoid infinite loops.
-    """
-    # Fetch all analyses once
-    all_analyses = api.list_analyses()
-    # Filter those matching our deleted workflows
-    to_delete = [
-        a
-        for a in all_analyses
-        if a.get("deletable", False)
-        and any(
-            a["analysis_key"].startswith(f"{WORKFLOW_SUBDIR}/{name}:")
-            for name in deleted
-        )
-    ]
-    # Delete each exactly once
-    for entry in to_delete:
+    # 2) pick out only the ones belonging to our deleted workflows
+    to_delete = []
+    prefix = WORKFLOW_SUBDIR + "/"
+    for analysis in all_analyses:
+        key = analysis.get("analysis_key", "")
+        # analysis_key looks like ".github/workflows/semgrep.yml:HASH"
+        if any(key.startswith(f"{prefix}{wf}:") for wf in deleted_workflows):
+            to_delete.append(analysis["url"])
+
+    # 3) delete each one
+    for url in to_delete:
         try:
-            api.delete_analysis(entry["url"])
-            logger.info("Deleted analysis: %s", entry["id"])
+            api.delete_analysis(url)
+            logger.info("Deleted analysis at %s", url)
         except APIError as e:
-            logger.warning("Failed to delete analysis %s: %s", entry["id"], e)
+            logger.warning("Failed to delete analysis %s: %s", url, e)
 
 
 ## Helper: Credential Helper Check ----------------------------------------------------------------
@@ -549,7 +590,7 @@ def main() -> None:
     # Initialize Git and API clients
     source_repo = GitRepo(SOURCE_REPO, source_path, args.branch)
     target_repo = GitRepo(
-        f"https://github.com/{owner}/{repo}.git", target_path, args.branch
+        f"git@github.com:{owner}/{repo}.git", target_path, args.branch
     )
 
     api_client = GitHubAPI(owner, repo, token)
