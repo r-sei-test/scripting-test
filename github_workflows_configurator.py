@@ -401,56 +401,49 @@ class GitHubAPI:
         if resp.status_code != 200:
             raise APIError(f"Failed to list analyses: {resp.text}")
         return resp.json()
-
+    
     def delete_analysis(self, analysis_url: str) -> None:
         """
-        Delete a single analysis.  Handles all GitHub variants that ask
-        for explicit confirmation: 200, 202 **or** 400 with a confirm_delete hint.
+        Delete a single code‑scanning analysis, handling all GitHub variants:
+         - 204 / 404 → already gone
+         - 200 / 202 → success (async or already deleted)
+         - 400 + 'confirm_delete' in body → retry with ?confirm_delete=true
         """
-        def _needs_confirm(resp: requests.Response) -> bool:
-            return (
-                resp.status_code in (200, 202) or
-                (resp.status_code == 400 and "confirm_delete" in resp.text)
-            )
-
         resp = self._request("DELETE", analysis_url)
 
-        # Already gone?
+        # 1) Already gone?
         if resp.status_code in (204, 404):
             logger.info("Analysis already removed: %s", analysis_url)
             return
 
-        # GitHub says: “please confirm first”
-        if _needs_confirm(resp):
-            # Use the URL GitHub gives us if present, otherwise just add the flag
-            confirm_url = (
-                resp.json().get("confirm_delete_url")
-                if resp.headers.get("content-type", "").startswith("application/json")
-                else None
-            )
+        # 2) 200 or 202 → success, done.
+        if resp.status_code in (200, 202):
+            logger.info("Deleted analysis: %s (status %s)", analysis_url, resp.status_code)
+            return
+
+        # 3) 400 with “confirm_delete” hint → re‑call with flag
+        if resp.status_code == 400 and "confirm_delete" in resp.text:
+            # try JSON confirm_delete_url first
+            confirm_url = None
+            if resp.headers.get("content-type", "").startswith("application/json"):
+                try:
+                    confirm_url = resp.json().get("confirm_delete_url")
+                except ValueError:
+                    pass
+            # fallback: append the flag ourselves
             if not confirm_url:
-                # fall back to same URL + flag
-                confirm_url = (
-                    analysis_url
-                    if analysis_url.endswith("?confirm_delete=true")
-                    else analysis_url + "?confirm_delete=true"
-                )
+                confirm_url = analysis_url + \
+                              ("" if analysis_url.endswith("?confirm_delete=true") else "?confirm_delete=true")
 
             resp2 = self._request("DELETE", confirm_url)
-
-            if resp2.status_code in (204, 404):
-                logger.info("Confirmed and deleted analysis at %s", confirm_url)
+            if resp2.status_code in (200, 202, 204, 404):
+                logger.info("Confirmed & deleted analysis: %s", confirm_url)
                 return
+            # if we still haven’t gotten a 204/404, it really is an error
+            raise APIError(f"Confirm-delete failed ({resp2.status_code}): {resp2.text}")
 
-            raise APIError(
-                f"Confirm‑delete failed ({resp2.status_code}): {resp2.text}"
-            )
-
-        # Anything else is a real failure
-        raise APIError(
-            f"Failed to delete analysis ({resp.status_code}): {resp.text}"
-        )
-
+        # Anything else is a genuine failure
+        raise APIError(f"Failed to delete analysis ({resp.status_code}): {resp.text}")
 
 def cleanup_remote_workflows(api: GitHubAPI, deleted: List[str]) -> None:
     """
