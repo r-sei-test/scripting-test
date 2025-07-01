@@ -15,6 +15,7 @@ Usage:
 
 import argparse  # For parsing command-line arguments
 import logging  # For logging progress and errors
+import os # For calls to operating system services
 import sys  # For system exit
 import shutil  # For file operations like removing directories
 import subprocess  # For running Git commands
@@ -23,6 +24,10 @@ from pathlib import Path  # For path manipulations
 import tempfile  # For creating isolated temp directories
 from typing import List, Dict  # For type annotations
 import requests  # For interacting with GitHub REST API
+import certifi   # Reliable Mozilla CA bundle
+
+# Force Python's ssl module & requests to use certifi's bundle:
+os.environ["SSL_CERT_FILE"] = certifi.where()
 
 ## Constants ---------------------------------------------------------------
 # Defaults and configuration values
@@ -297,6 +302,7 @@ class GitHubAPI:
                 "Accept": "application/vnd.github.v3+json",
             }
         )
+        self.session.verify = certifi.where()
         self.max_retries = 2  # Number of retry attempts
         self.backoff = 2  # Base for exponential backoff delay
 
